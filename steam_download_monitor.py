@@ -5,16 +5,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-def find_steam_root() -> Path | None:
+def find_steam_root():
     if sys.platform.startswith("win"):
-        # 1) Windows Registry
         try:
             import winreg
-            for value_name in ("SteamPath", "InstallPath"):
+            for v in ("SteamPath", "InstallPath"):
                 try:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
-                        steam_path, _ = winreg.QueryValueEx(k, value_name)
-                        p = Path(steam_path)
+                        p = Path(winreg.QueryValueEx(k, v)[0])
                         if p.exists():
                             return p
                 except FileNotFoundError:
@@ -22,38 +20,50 @@ def find_steam_root() -> Path | None:
         except Exception:
             pass
 
-        candidates = [
+        for p in [
             Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Steam",
             Path(os.environ.get("PROGRAMFILES", "")) / "Steam",
             Path("C:/Steam"),
-        ]
-        for p in candidates:
+        ]:
             if p.exists():
                 return p
 
     if sys.platform.startswith("linux"):
-        candidates = [
-            Path.home() / ".steam" / "steam",
-            Path.home() / ".local" / "share" / "Steam",
-            Path.home() / ".steam" / "root",
-        ]
-        for p in candidates:
+        for p in [Path.home()/".local/share/Steam", Path.home()/".steam/steam", Path.home()/".steam/root"]:
             if p.exists():
                 return p
 
     if sys.platform == "darwin":
-        candidates = [
-            Path.home() / "Library" / "Application Support" / "Steam",
-        ]
-        for p in candidates:
-            if p.exists():
-                return p
+        p = Path.home() / "Library/Application Support/Steam"
+        if p.exists():
+            return p
 
     return None
 
-# ---------------------------
-# Helpers
-# ---------------------------
+def parse_kv(manifest_path: Path) -> dict:
+    kv = {}
+    if not manifest_path.exists():
+        return kv
+    try:
+        text = manifest_path.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r'"\s*([^"]+)\s*"\s*"([^"]*)\s*"', text):
+            kv[m.group(1).strip()] = m.group(2).strip()
+    except Exception:
+        pass
+    return kv
+
+def get_int(kv: dict, key: str):
+    v = kv.get(key)
+    return int(v) if v and v.isdigit() else None
+
+def bytes(n: int) -> str:
+    if n >= 1024**3:
+        return f"{n/(1024**3):.2f} GB"
+    if n >= 1024**2:
+        return f"{n/(1024**2):.2f} MB"
+    if n >= 1024:
+        return f"{n/1024:.1f} KB"
+    return f"{n} B"
 
 def speed(bps: float) -> str:
     mbps = bps / (1024 * 1024)
@@ -62,78 +72,6 @@ def speed(bps: float) -> str:
     kbps = bps / 1024
     return f"{kbps:.0f} KB/s"
 
-def folder_size_bytes(path: Path) -> int:
-    total = 0
-    if not path.exists():
-        return 0
-    try:
-        for root, _, files in os.walk(path):
-            for fn in files:
-                fp = Path(root) / fn
-                try:
-                    total += fp.stat().st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return total
-
-def parse_app_name_from_manifest(manifest_path: Path) -> str | None:
-    if not manifest_path.exists():
-        return None
-    try:
-        text = manifest_path.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r'"\s*name\s*"\s*"([^"]+)"', text)
-        return m.group(1) if m else None
-    except Exception:
-        return None
-
-# ---------------------------
-# Parse download progress from manifest 
-# ---------------------------
-
-def parse_manifest_kv(manifest_path: Path) -> dict:
-    """
-    Простой KV-парсер под appmanifest_*.acf
-    """
-    kv = {}
-    if not manifest_path.exists():
-        return kv
-    try:
-        text = manifest_path.read_text(encoding="utf-8", errors="ignore")
-        # пары вида "key"  "value"
-        for m in re.finditer(r'"\s*([^"]+)\s*"\s*"([^"]*)\s*"', text):
-            k = m.group(1).strip()
-            v = m.group(2).strip()
-            kv[k] = v
-    except Exception:
-        pass
-    return kv
-
-def get_downloaded_bytes_from_manifest(manifest_path: Path) -> int | None:
-    kv = parse_manifest_kv(manifest_path)
-
-    candidates = [
-        "BytesDownloaded",
-        "bytesdownloaded",
-        "DownloadedBytes",
-        "downloaded_bytes",
-        "BytesToDownload",  
-        "SizeOnDisk",      
-    ]
-
-    for key in candidates:
-        if key in kv:
-            s = kv[key]
-            if s.isdigit():
-                val = int(s)
-                return val
-    return None
-
-# ---------------------------
-# Detect active downloads
-# ---------------------------
-
 def detect_active_downloads(steam_root: Path):
     steamapps = steam_root / "steamapps"
     downloading = steamapps / "downloading"
@@ -141,40 +79,29 @@ def detect_active_downloads(steam_root: Path):
         return []
 
     active = []
-    for item in downloading.iterdir():
-        if item.is_dir() and item.name.isdigit():
-            appid = item.name
+    for d in downloading.iterdir():
+        if d.is_dir() and d.name.isdigit():
+            appid = d.name
+            manifest = steamapps / f"appmanifest_{appid}.acf"
+            kv = parse_kv(manifest)
+            name = kv.get("name") or f"AppID {appid}"
+            # считаем активным, если есть прогресс-ключи или папка не пустая
+            has_progress = any(k in kv for k in ("BytesToDownload", "BytesDownloaded", "BytesToStage", "BytesStaged"))
             try:
-                has_any = any(item.rglob("*"))
+                non_empty = any(d.rglob("*"))
             except Exception:
-                has_any = True
-            if has_any:
-                manifest = steamapps / f"appmanifest_{appid}.acf"
-                name = parse_app_name_from_manifest(manifest) or f"AppID {appid}"
-                active.append((appid, name, item, manifest))
+                non_empty = True
+            if has_progress or non_empty:
+                active.append((appid, name, manifest))
     return active
 
-# ---------------------------
-# Pause detection via logs
-# ---------------------------
-
-def detect_pause_via_logs(steam_root: Path, appid: str) -> bool:
-    log_path = steam_root / "logs" / "content_log.txt"
-    if not log_path.exists():
-        return False
-
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-2000:]
-        s = "\n".join(lines).lower()
-        if appid in s and any(k in s for k in ("paused", "pause", "suspend", "suspended")):
-            return True
-    except Exception:
-        pass
-    return False
-
-# ---------------------------
-# Main
-# ---------------------------
+def status_from_deltas(dd: int, ds: int) -> str:
+    # dd: delta downloaded, ds: delta staged
+    if dd > 0:
+        return "downloading"
+    if ds > 0:
+        return "staging/installing"
+    return "paused/idle"
 
 def main():
     steam_root = None
@@ -183,14 +110,11 @@ def main():
         p = Path(env_root)
         if p.exists():
             steam_root = p
-
     if steam_root is None:
         steam_root = find_steam_root()
 
     if not steam_root:
-        print("Steam не найден. Укажи путь вручную через STEAM_ROOT.")
-        print("Windows PowerShell:  $env:STEAM_ROOT='D:\\Games\\Steam'")
-        print("Linux/macOS: export STEAM_ROOT=~/.local/share/Steam")
+        print("Steam не найден. Укажи путь через STEAM_ROOT.")
         return
 
     print(f"[INFO] Steam root: {steam_root}")
@@ -198,45 +122,50 @@ def main():
     interval = 60
     repeats = 5
 
-    prev_manifest_metric = {}  # appid -> bytes (from manifest proxy)
-    prev_folder_size = {}      # appid -> bytes (from folder size)
+    prev_downloaded = {}  # appid -> bytes
+    prev_staged = {}      # appid -> bytes
 
     for i in range(repeats):
         ts = datetime.now().strftime("%H:%M:%S")
         active = detect_active_downloads(steam_root)
 
         if not active:
-            print(f"[{ts}] Сейчас нет активных загрузок в Steam (или Steam не качает игру).")
+            print(f"[{ts}] Сейчас нет активных загрузок.")
         else:
-            for appid, name, folder, manifest in active:
-                m_bytes = get_downloaded_bytes_from_manifest(manifest)
+            for appid, name, manifest in active:
+                kv = parse_kv(manifest)
 
-                speed_bps = 0.0
-                source = ""
+                bd = get_int(kv, "BytesDownloaded") or 0
+                bt = get_int(kv, "BytesToDownload") or 0
+                bs = get_int(kv, "BytesStaged") or 0
+                bst = get_int(kv, "BytesToStage") or 0
 
-                if m_bytes is not None:
-                    prev = prev_manifest_metric.get(appid, m_bytes)
-                    delta = max(0, m_bytes - prev)
-                    speed_bps = delta / interval
-                    prev_manifest_metric[appid] = m_bytes
-                    source = "manifest"
-                else:
-                    size_now = folder_size_bytes(folder)
-                    prev = prev_folder_size.get(appid, size_now)
-                    delta = max(0, size_now - prev)
-                    speed_bps = delta / interval
-                    prev_folder_size[appid] = size_now
-                    source = "folder"
+                bd_prev = prev_downloaded.get(appid, bd)
+                bs_prev = prev_staged.get(appid, bs)
 
-                paused_by_logs = detect_pause_via_logs(steam_root, appid)
-                if speed_bps > 0:
-                    status = "downloading"
-                else:
-                    status = "paused" if paused_by_logs else "idle/paused"
+                d_bd = max(0, bd - bd_prev)
+                d_bs = max(0, bs - bs_prev)
 
+                speed_bps = d_bd / interval
+                staged_bps = d_bs / interval
+
+                status = status_from_deltas(d_bd, d_bs)
+
+                # прогресс в %
+                pct = ""
+                if bt > 0:
+                    pct = f"{(bd / bt * 100):.1f}%"
+
+                # печать: “за минуту скачано N” тоже даём
                 print(
-                    f"[{ts}] {name} (appid={appid}) | status={status} | speed={speed(speed_bps)} | source={source}"
+                    f"[{ts}] {name} (appid={appid}) | {status} | "
+                    f"downloaded: {bytes(bd)}/{bytes(bt)} {pct} | "
+                    f"+{bytes(d_bd)}/min ({speed(speed_bps)}) | "
+                    f"staged +{bytes(d_bs)}/min ({speed(staged_bps)})"
                 )
+
+                prev_downloaded[appid] = bd
+                prev_staged[appid] = bs
 
         if i < repeats - 1:
             time.sleep(interval)
