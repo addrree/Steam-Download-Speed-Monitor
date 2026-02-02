@@ -5,6 +5,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# ---------------------------
+# Steam path discovery
+# ---------------------------
+
 def find_steam_root():
     if sys.platform.startswith("win"):
         try:
@@ -40,30 +44,129 @@ def find_steam_root():
 
     return None
 
-def parse_kv(manifest_path: Path) -> dict:
-    kv = {}
+# ---------------------------
+# Active downloads + name
+# ---------------------------
+
+def parse_manifest_name(manifest_path: Path):
     if not manifest_path.exists():
-        return kv
+        return None
     try:
         text = manifest_path.read_text(encoding="utf-8", errors="ignore")
-        for m in re.finditer(r'"\s*([^"]+)\s*"\s*"([^"]*)\s*"', text):
-            kv[m.group(1).strip()] = m.group(2).strip()
+        m = re.search(r'"\s*name\s*"\s*"([^"]+)"', text)
+        return m.group(1) if m else None
     except Exception:
-        pass
-    return kv
+        return None
 
-def get_int(kv: dict, key: str):
-    v = kv.get(key)
-    return int(v) if v and v.isdigit() else None
+def detect_active_downloads(steam_root: Path, recent_seconds: int):
+    steamapps = steam_root / "steamapps"
+    downloading = steamapps / "downloading"
+    if not downloading.exists():
+        return []
 
-def bytes(n: int) -> str:
-    if n >= 1024**3:
-        return f"{n/(1024**3):.2f} GB"
-    if n >= 1024**2:
-        return f"{n/(1024**2):.2f} MB"
-    if n >= 1024:
-        return f"{n/1024:.1f} KB"
-    return f"{n} B"
+    now = time.time()
+    active = []
+    for d in downloading.iterdir():
+        if d.is_dir() and d.name.isdigit():
+            try:
+                non_empty = any(d.rglob("*"))
+            except Exception:
+                non_empty = True
+            if not non_empty:
+                continue
+
+            try:
+                mtime = d.stat().st_mtime
+            except OSError:
+                mtime = now
+
+            if now - mtime > recent_seconds:
+                continue
+
+            appid = d.name
+            manifest = steamapps / f"appmanifest_{appid}.acf"
+            name = parse_manifest_name(manifest) or f"AppID {appid}"
+            active.append((appid, name))
+    return active
+
+# ---------------------------
+# Incremental log reading + speed parsing
+# ---------------------------
+
+_SPEED_PATTERNS = [
+    re.compile(r'(\d+(?:\.\d+)?)\s*(GB/s|MB/s|KB/s|B/s)\b', re.IGNORECASE),
+    re.compile(r'(\d+(?:\.\d+)?)\s*(Gbps|Mbps|Kbps|bps)\b', re.IGNORECASE),
+]
+
+def speed_to_bps(val: float, unit: str):
+    u = unit.lower()
+    if u == "b/s":
+        return val
+    if u == "kb/s":
+        return val * 1024
+    if u == "mb/s":
+        return val * 1024 * 1024
+    if u == "gb/s":
+        return val * 1024 * 1024 * 1024
+
+    if u == "bps":
+        return val / 8
+    if u == "kbps":
+        return (val * 1000) / 8
+    if u == "mbps":
+        return (val * 1_000_000) / 8
+    if u == "gbps":
+        return (val * 1_000_000_000) / 8
+    return None
+
+def parse_last_speed_bps(text: str):
+    last = None
+    for pat in _SPEED_PATTERNS:
+        for m in pat.finditer(text):
+            bps = speed_to_bps(float(m.group(1)), m.group(2))
+            if bps is not None:
+                last = bps
+    return last
+
+class LogTailer:
+    def __init__(self, path: Path, start_at_end: bool = True):
+        self.path = path
+        self.offset = 0
+        self.last_append_ts = 0.0 
+        if start_at_end:
+            self.seek_end()
+
+    def seek_end(self):
+        if self.path.exists():
+            try:
+                self.offset = self.path.stat().st_size
+            except OSError:
+                self.offset = 0
+        else:
+            self.offset = 0
+
+    def read_new_text(self, max_bytes: int = 200_000) -> str:
+        if not self.path.exists():
+            return ""
+        try:
+            size = self.path.stat().st_size
+            if size < self.offset:
+                self.offset = 0
+
+            if size == self.offset:
+                return ""
+
+            with self.path.open("rb") as f:
+                f.seek(self.offset, os.SEEK_SET)
+                data = f.read(max_bytes)
+
+            if data:
+                self.offset += len(data)
+                self.last_append_ts = time.time()
+                return data.decode("utf-8", errors="ignore")
+            return ""
+        except Exception:
+            return ""
 
 def speed(bps: float) -> str:
     mbps = bps / (1024 * 1024)
@@ -72,36 +175,9 @@ def speed(bps: float) -> str:
     kbps = bps / 1024
     return f"{kbps:.0f} KB/s"
 
-def detect_active_downloads(steam_root: Path):
-    steamapps = steam_root / "steamapps"
-    downloading = steamapps / "downloading"
-    if not downloading.exists():
-        return []
-
-    active = []
-    for d in downloading.iterdir():
-        if d.is_dir() and d.name.isdigit():
-            appid = d.name
-            manifest = steamapps / f"appmanifest_{appid}.acf"
-            kv = parse_kv(manifest)
-            name = kv.get("name") or f"AppID {appid}"
-            # считаем активным, если есть прогресс-ключи или папка не пустая
-            has_progress = any(k in kv for k in ("BytesToDownload", "BytesDownloaded", "BytesToStage", "BytesStaged"))
-            try:
-                non_empty = any(d.rglob("*"))
-            except Exception:
-                non_empty = True
-            if has_progress or non_empty:
-                active.append((appid, name, manifest))
-    return active
-
-def status_from_deltas(dd: int, ds: int) -> str:
-    # dd: delta downloaded, ds: delta staged
-    if dd > 0:
-        return "downloading"
-    if ds > 0:
-        return "staging/installing"
-    return "paused/idle"
+# ---------------------------
+# Main
+# ---------------------------
 
 def main():
     steam_root = None
@@ -119,53 +195,40 @@ def main():
 
     print(f"[INFO] Steam root: {steam_root}")
 
-    interval = 60
-    repeats = 5
+    logs_dir = steam_root / "logs"
+    tailers = [
+        LogTailer(logs_dir / "download_log.txt", start_at_end=True),
+        LogTailer(logs_dir / "content_log.txt", start_at_end=True),
+    ]
 
-    prev_downloaded = {}  # appid -> bytes
-    prev_staged = {}      # appid -> bytes
+    interval = 60         
+    repeats = 5           
+    STALE_SECONDS = 10     # если лог не дописывался >10 секунд -> считаем скорость 0
+    ACTIVE_FOLDER_RECENT = 60  # downloading/<appid> должен меняться за последнюю минуту
+
+    last_speed_bps = 0.0
 
     for i in range(repeats):
         ts = datetime.now().strftime("%H:%M:%S")
-        active = detect_active_downloads(steam_root)
+
+        active = detect_active_downloads(steam_root, recent_seconds=ACTIVE_FOLDER_RECENT)
+        new_text = ""
+        for t in tailers:
+            new_text += "\n" + t.read_new_text()
+        new_speed = parse_last_speed_bps(new_text) if new_text.strip() else None
+        if new_speed is not None:
+            last_speed_bps = new_speed
+        last_append = max(t.last_append_ts for t in tailers)
+        if time.time() - last_append > STALE_SECONDS:
+            last_speed_bps = 0.0
+
+        status = "downloading" if last_speed_bps > 0 else "paused/idle"
 
         if not active:
-            print(f"[{ts}] Сейчас нет активных загрузок.")
+            print(f"[{ts}] Нет активных загрузок. | {status} | speed={speed(last_speed_bps)}")
         else:
-            for appid, name, manifest in active:
-                kv = parse_kv(manifest)
-
-                bd = get_int(kv, "BytesDownloaded") or 0
-                bt = get_int(kv, "BytesToDownload") or 0
-                bs = get_int(kv, "BytesStaged") or 0
-                bst = get_int(kv, "BytesToStage") or 0
-
-                bd_prev = prev_downloaded.get(appid, bd)
-                bs_prev = prev_staged.get(appid, bs)
-
-                d_bd = max(0, bd - bd_prev)
-                d_bs = max(0, bs - bs_prev)
-
-                speed_bps = d_bd / interval
-                staged_bps = d_bs / interval
-
-                status = status_from_deltas(d_bd, d_bs)
-
-                # прогресс в %
-                pct = ""
-                if bt > 0:
-                    pct = f"{(bd / bt * 100):.1f}%"
-
-                # печать: “за минуту скачано N” тоже даём
-                print(
-                    f"[{ts}] {name} (appid={appid}) | {status} | "
-                    f"downloaded: {bytes(bd)}/{bytes(bt)} {pct} | "
-                    f"+{bytes(d_bd)}/min ({speed(speed_bps)}) | "
-                    f"staged +{bytes(d_bs)}/min ({speed(staged_bps)})"
-                )
-
-                prev_downloaded[appid] = bd
-                prev_staged[appid] = bs
+            for appid, name in active:
+                print(f"[{ts}] {name}  | {status} | speed={speed(last_speed_bps)} | source=logs(realtime)")
 
         if i < repeats - 1:
             time.sleep(interval)
